@@ -1,0 +1,378 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Neon Face Scan</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;color:#bfe;font:13px/1.7 ui-monospace,Consolas,monospace}
+  canvas{position:fixed;inset:0;width:100%;height:100%}
+  .hud{position:fixed;pointer-events:none;letter-spacing:.04em}
+  #st{left:18px;top:14px}
+  #fps{left:18px;bottom:14px;font-size:20px;opacity:.85}
+  #keys{right:18px;bottom:14px;text-align:right;opacity:.55}
+  #msg{left:0;right:0;top:45%;text-align:center;font-size:15px;white-space:pre-wrap;padding:0 20px}
+  b{color:#fff;font-weight:600}
+  kbd{border:1px solid #fff5;border-radius:3px;padding:0 5px;margin-right:6px;font:inherit;color:#fff}
+  body.hide .hud:not(#msg){display:none}
+</style>
+</head>
+<body>
+<video id="cam" playsinline muted autoplay style="position:fixed;left:-2px;top:-2px;width:2px;height:2px;opacity:.01;pointer-events:none"></video>
+<canvas id="c"></canvas>
+<div id="st" class="hud">scan <b id="s1">loading</b><br>fingers <b id="s2">0</b></div>
+<div id="fps" class="hud"></div>
+<div id="keys" class="hud"><kbd>space</kbd>scatter the scan<br><kbd>f</kbd>fullscreen &nbsp; <kbd>h</kbd>hide readouts</div>
+<div id="msg" class="hud">Memuat model... izinkan akses kamera.</div>
+
+<script>
+// tampilkan SEMUA error javascript langsung di layar (tidak perlu DevTools)
+function showErr(t) {
+  let d = document.getElementById("msg");
+  if (!d) { d = document.createElement("div"); d.id = "msg"; d.className = "hud"; d.style.fontSize = "12px"; document.body.appendChild(d); }
+  d.style.display = ""; d.textContent = t;
+}
+window.onerror = (m, s, l, c, e) => showErr("JS ERROR: " + m + " @baris " + l + ":" + c + (e && e.stack ? "\n" + e.stack : ""));
+window.addEventListener("unhandledrejection", e =>
+  showErr("PROMISE ERROR: " + ((e.reason && (e.reason.stack || e.reason.message)) || e.reason)));
+</script>
+
+<script type="module">
+import { FilesetResolver, FaceLandmarker, HandLandmarker }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const cam = $("cam"), cv = $("c"), ctx = cv.getContext("2d");
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const ease = t => t * t * (3 - 2 * t);
+
+// Titik-titik kunci wajah untuk mesh "low-poly" (indeks MediaPipe Face Mesh)
+const KEY = [10,297,284,389,454,361,397,379,400,152,176,150,172,132,234,162,54,67,
+  105,66,107,334,296,336,33,133,159,145,362,263,386,374,
+  168,6,4,1,98,327,2,61,291,13,14,0,17,205,425,50,280];
+const N = 478;
+const HUES = [180,130,30,55,270,320]; // warna per jumlah jari (0..5)
+
+let W, H, dpr;
+function resize() {
+  dpr = Math.min(devicePixelRatio || 1, 1.5);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener("resize", resize); resize();
+
+// Delaunay (Bowyer-Watson) untuk membuat segitiga dari titik kunci
+function delaunay(p) {
+  const n = p.length, s = 50;
+  const v = [...p, [-s, -s], [s, -s], [0, s]];
+  let tris = [[n, n + 1, n + 2]];
+  const inCircle = (t, q) => {
+    const [a, b, c] = t.map(i => v[i]);
+    const ax = a[0]-q[0], ay = a[1]-q[1], bx = b[0]-q[0], by = b[1]-q[1], cx = c[0]-q[0], cy = c[1]-q[1];
+    const det = (ax*ax+ay*ay)*(bx*cy-cx*by) - (bx*bx+by*by)*(ax*cy-cx*ay) + (cx*cx+cy*cy)*(ax*by-bx*ay);
+    const o = (b[0]-a[0])*(c[1]-a[1]) - (b[1]-a[1])*(c[0]-a[0]);
+    return o > 0 ? det > 0 : det < 0;
+  };
+  for (let i = 0; i < n; i++) {
+    const bad = tris.filter(t => inCircle(t, v[i])), edges = [];
+    bad.forEach(t => [[t[0],t[1]],[t[1],t[2]],[t[2],t[0]]].forEach(e => {
+      const k = edges.findIndex(f => (f[0]==e[0]&&f[1]==e[1]) || (f[0]==e[1]&&f[1]==e[0]));
+      k < 0 ? edges.push(e) : edges.splice(k, 1);
+    }));
+    tris = tris.filter(t => !bad.includes(t)).concat(edges.map(e => [e[0], e[1], i]));
+  }
+  return tris.filter(t => t.every(i => i < n));
+}
+
+// Hitung jari yang terangkat dari 21 landmark tangan
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+function raisedOf(h) {
+  return [
+    dist(h[4], h[17]) > dist(h[3], h[17]) * 1.1,   // jempol
+    dist(h[8], h[0]) > dist(h[6], h[0]) * 1.05,
+    dist(h[12], h[0]) > dist(h[10], h[0]) * 1.05,
+    dist(h[16], h[0]) > dist(h[14], h[0]) * 1.05,
+    dist(h[20], h[0]) > dist(h[18], h[0]) * 1.05
+  ];
+}
+
+// ---- efek tangan ----
+const LINKS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+const TIPS = [4, 8, 12, 16, 20];
+const HS = new Float32Array(21 * 3);
+const prevTip = new Float32Array(10);
+const parts = [];
+let haveHand = false, handOn = false, handA = 0;
+let raised = [false, false, false, false, false];
+
+function spawnPart(x, y, h) {
+  if (parts.length > 450) return;
+  parts.push({ x, y, vx: (Math.random() - .5) * 110, vy: (Math.random() - .5) * 110 - 35,
+    l: 1, s: 1 + Math.random() * 2.4, h });
+}
+
+async function init() {
+  // minta kamera lebih dulu agar prompt izin langsung muncul
+  const msg = $("msg");
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: "user" }, audio: false });
+  } catch (e) {
+    const name = e.name || "";
+    let m = "Kamera gagal (" + name + "): ";
+    m += name === "NotAllowedError" ? "izin kamera ditolak. Klik ikon kamera di bilah alamat browser, pilih Izinkan, lalu muat ulang halaman."
+      : (name === "NotFoundError" || name === "DevicesNotFoundError") ? "kamera tidak ditemukan. Cek kamera terpasang."
+      : (name === "NotReadableError" || name === "TrackStartError") ? "kamera sedang dipakai aplikasi lain (Zoom/Teams/Camera). Tutup aplikasi itu lalu muat ulang."
+      : name === "OverconstrainedError" ? "kamera tidak mendukung resolusi 1280x720."
+      : "browser Anda tidak mengizinkan kamera di situs ini.";
+    throw new Error(m);
+  }
+  msg.textContent = "Kamera OK. Memuat model... (butuh internet)";
+  const base = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+  const fs = await FilesetResolver.forVisionTasks(base);
+  const G = "https://storage.googleapis.com/mediapipe-models/";
+  const make = async (cls, url, extra) => {
+    for (const delegate of ["GPU", "CPU"]) {
+      try { return await cls.createFromOptions(fs, { baseOptions: { modelAssetPath: url, delegate }, runningMode: "VIDEO", ...extra }); }
+      catch (e) { console.warn(delegate, e); }
+    }
+    throw new Error("model gagal dimuat");
+  };
+  const face = await make(FaceLandmarker, G + "face_landmarker/face_landmarker/float16/1/face_landmarker.task", { numFaces: 1 });
+  const hand = await make(HandLandmarker, G + "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", { numHands: 1 });
+  cam.srcObject = stream;
+  await cam.play();
+  return { face, hand };
+}
+
+// ---- state ----
+const S = new Float32Array(N * 3);
+let have = false, faceOn = false, faceA = 0, edges = null;
+let form = 1, scatterUntil = 0, fingers = 0, hue = 180;
+let lastVT = -1, prev = 0, frames = 0, fpsT = 0, lastStatus = "", detErrs = 0;
+let detCalls = 0, detHits = 0, detUndef = 0;
+const off = document.createElement("canvas");
+const octx = off.getContext("2d", { willReadFrequently: true });
+const TESS = FaceLandmarker.FACE_LANDMARKS_TESSELATION;
+const rnd = Array.from({ length: N }, () => ({ a: Math.random()*6.283, r: .25 + Math.random()*.9, d: Math.random()*.6, w: Math.random()*6.283 }));
+
+function buildEdges(lm) {
+  const ar = cam.videoWidth / cam.videoHeight, seen = new Set();
+  edges = [];
+  delaunay(KEY.map(i => [lm[i].x * ar, lm[i].y])).forEach(([a, b, c]) =>
+    [[a,b],[b,c],[c,a]].forEach(([p, q]) => {
+      const k = Math.min(p, q) * 100 + Math.max(p, q);
+      if (!seen.has(k)) { seen.add(k); edges.push([p, q]); }
+    }));
+}
+
+function neon(path, col, w, glow) {
+  ctx.save();
+  ctx.lineJoin = ctx.lineCap = "round";
+  ctx.shadowColor = col; ctx.shadowBlur = glow; ctx.strokeStyle = col; ctx.lineWidth = w;
+  ctx.stroke(path); ctx.stroke(path);
+  ctx.shadowBlur = 0; ctx.strokeStyle = `hsla(${hue},100%,90%,.9)`; ctx.lineWidth = Math.max(.8, w * .35);
+  ctx.stroke(path);
+  ctx.restore();
+}
+
+// "Scan" wajah berupa titik+garis tipis di kiri atas; bisa hancur (scatter) dan menyatu lagi
+function drawGhost(t, vw, vh) {
+  const cx = S[168*3], cy = S[168*3+1], cz = S[168*3+2];
+  const fh = Math.abs(S[152*3+1] - S[10*3+1]) * vh || 1;
+  const ang = Math.sin(t / 1400) * .55, ca = Math.cos(ang), sa = Math.sin(ang);
+  const GH = H * .5, gx = W * .27, gy = H * .42, lf = ease(form);
+  const px = new Float32Array(N), py = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const u = -(S[i*3] - cx) * vw / fh, v = (S[i*3+1] - cy) * vh / fh, z = (S[i*3+2] - cz) * vw / fh;
+    const hx = gx + (u * ca + z * sa) * GH, hy = gy + v * GH;
+    const r = rnd[i], f = ease(clamp(form * 1.7 - r.d));
+    const sx = hx + Math.cos(r.a + t / 2500 + r.w) * r.r * H * .6;
+    const sy = hy + Math.sin(r.a * 1.3 + t / 2100 + r.w) * r.r * H * .5;
+    px[i] = lerp(sx, hx, f); py[i] = lerp(sy, hy, f);
+  }
+  ctx.save();
+  ctx.globalAlpha = faceA; ctx.globalCompositeOperation = "lighter";
+  if (lf > .02) {
+    ctx.beginPath();
+    for (const e of TESS) { ctx.moveTo(px[e.start], py[e.start]); ctx.lineTo(px[e.end], py[e.end]); }
+    ctx.strokeStyle = `hsla(${hue},100%,60%,${.28 * lf * lf})`; ctx.lineWidth = .6; ctx.stroke();
+  }
+  ctx.fillStyle = `hsla(${hue},100%,70%,${.35 + .4 * (1 - lf)})`;
+  for (let i = 0; i < N; i++) ctx.fillRect(px[i] - .9, py[i] - .9, 1.8, 1.8);
+  ctx.restore();
+}
+
+// Efek tangan: skeleton neon, orb ujung jari, ring pulse, dan percikan
+function drawHand(t, ox, oy, dw, dh) {
+  const X = i => W - (ox + HS[i*3] * dw), Y = i => oy + HS[i*3+1] * dh;
+  const tips = TIPS.map(i => [X(i), Y(i)]);
+  const hw = Math.max(2, Math.hypot(X(0) - X(9), Y(0) - Y(9)) / 40);
+
+  ctx.save();
+  ctx.globalAlpha = handA;
+  ctx.globalCompositeOperation = "lighter";
+
+  // skeleton tangan
+  const sk = new Path2D();
+  for (const [a, b] of LINKS) { sk.moveTo(X(a), Y(a)); sk.lineTo(X(b), Y(b)); }
+  neon(sk, `hsl(${hue},100%,55%)`, hw, 14);
+
+  // sendi + ujung jari
+  const joints = new Path2D();
+  for (let i = 0; i < 21; i++) { joints.moveTo(X(i) + hw * .8, Y(i)); joints.arc(X(i), Y(i), hw * .8, 0, 6.283); }
+  ctx.fillStyle = `hsl(${hue},100%,80%)`; ctx.fill(joints);
+
+  // orb + percikan di tiap ujung jari (lebih terang bila jari terangkat)
+  tips.forEach(([x, y], k) => {
+    const up = raised[k];
+    const pulse = 1 + Math.sin(t / 220 + k * 1.3) * .18;
+    const r = (up ? hw * 4.5 : hw * 2.4) * pulse;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, `hsla(${(hue + k * 8) % 360},100%,95%,${up ? .95 : .55})`);
+    g.addColorStop(.4, `hsla(${hue},100%,70%,${up ? .6 : .25})`);
+    g.addColorStop(1, `hsla(${hue},100%,60%,0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, 6.283); ctx.fill();
+
+    // ring pulse untuk jari terangkat
+    if (up) {
+      const ph = (t / 900 + k * .2) % 1;
+      ctx.strokeStyle = `hsla(${hue},100%,85%,${(1 - ph) * .7})`;
+      ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.arc(x, y, r + ph * hw * 14, 0, 6.283); ctx.stroke();
+      if (Math.random() < .3) spawnPart(x, y, (hue + k * 8) % 360);
+    }
+
+    // percikan mengikuti gerakan cepat
+    const px = prevTip[k*2], py = prevTip[k*2+1];
+    if (px && Math.hypot(x - px, y - py) > hw * 2.5 && Math.random() < .5) spawnPart(x, y, hue);
+    prevTip[k*2] = x; prevTip[k*2+1] = y;
+  });
+  ctx.restore();
+}
+
+// update + gambar partikel percikan
+function drawParts(dt) {
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.l -= dt * 1.4;
+    if (p.l <= 0) { parts.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= .96; p.vy = p.vy * .96 + 60 * dt;
+    const s = p.s * p.l;
+    ctx.fillStyle = `hsla(${p.h},100%,75%,${p.l * .9})`;
+    ctx.beginPath(); ctx.arc(p.x, p.y, s, 0, 6.283); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function start({ face, hand }) {
+  $("msg").style.display = "none";
+  function loop(now) {
+    requestAnimationFrame(loop);
+    const dt = Math.min(.05, (now - prev) / 1000); prev = now;
+    const vw = cam.videoWidth, vh = cam.videoHeight;
+    if (!vw) return;
+
+    // gambar kamera dulu supaya layar tidak pernah hitam walau deteksi error
+    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+    const sc = Math.max(W / vw, H / vh), dw = vw * sc, dh = vh * sc, ox = (W - dw) / 2, oy = (H - dh) / 2;
+    ctx.save(); ctx.translate(W, 0); ctx.scale(-1, 1); ctx.globalAlpha = .45;
+    ctx.drawImage(cam, ox, oy, dw, dh); ctx.restore();
+
+    // deteksi hanya saat ada frame kamera baru (dibungkus try/catch agar render tetap jalan)
+    if (cam.currentTime !== lastVT) {
+      lastVT = cam.currentTime;
+      let lm = null, hl = null;
+      try {
+        if (off.width !== vw || off.height !== vh) { off.width = vw; off.height = vh; }
+        octx.drawImage(cam, 0, 0, vw, vh);
+        const fr = face.detectForVideo(off, now);
+        const hr = hand.detectForVideo(off, now);
+        lm = fr && fr.faceLandmarks ? fr.faceLandmarks[0] : null;
+        hl = hr && hr.landmarks ? hr.landmarks[0] : null;
+        detCalls++;
+        if (!fr || !fr.faceLandmarks) detUndef++;
+        if (lm) detHits++;
+      } catch (e) {
+        if (++detErrs < 4) console.error("detect:", e);
+        if (detErrs === 3 || detErrs % 180 === 0) showErr("Error deteksi: " + (e.message || e));
+        lm = hl = null;
+      }
+      faceOn = !!lm;
+      if (lm) {
+        const k = have ? .55 : 1;
+        for (let i = 0; i < N; i++) {
+          S[i*3] = lerp(S[i*3], lm[i].x, k); S[i*3+1] = lerp(S[i*3+1], lm[i].y, k); S[i*3+2] = lerp(S[i*3+2], lm[i].z, k);
+        }
+        have = true;
+        if (!edges) buildEdges(lm);
+      }
+      fingers = 0;
+      if (hl) {
+        const k = haveHand ? .5 : 1;
+        for (let i = 0; i < 21; i++) {
+          HS[i*3] = lerp(HS[i*3], hl[i].x, k); HS[i*3+1] = lerp(HS[i*3+1], hl[i].y, k); HS[i*3+2] = lerp(HS[i*3+2], hl[i].z, k);
+        }
+        haveHand = true;
+        raised = raisedOf(hl);
+        fingers = raised.reduce((a, b) => a + (b ? 1 : 0), 0);
+      }
+      handOn = !!hl;
+    }
+
+    // logika: warna ikut jumlah jari, telapak terbuka (5) atau spasi = scatter
+    const target = HUES[Math.min(5, fingers)];
+    hue = (hue + (((target - hue + 540) % 360) - 180) * .12 + 360) % 360;
+    const scat = now < scatterUntil || fingers === 5;
+    form = clamp(form + (scat ? -1.8 : .9) * dt);
+    faceA += ((faceOn ? 1 : 0) - faceA) * .15;
+    handA += ((handOn ? 1 : 0) - handA) * .18;
+    if (!handOn && handA < .02) haveHand = false;
+    const status = !have || (!faceOn && faceA < .05) ? "searching: wajah tidak terdeteksi" : scat ? (form < .03 ? "scattered" : "scattering") : (form > .98 ? "locked" : "reforming");
+    if (status !== lastStatus) { $("s1").textContent = status; lastStatus = status; }
+    $("s2").textContent = fingers;
+
+    // mesh neon di atas kamera
+    if (have && faceA > .02) {
+      drawGhost(now, vw, vh);
+      const X = i => W - (ox + S[i*3] * dw), Y = i => oy + S[i*3+1] * dh;
+      const path = new Path2D(), dots = new Path2D();
+      for (const [a, b] of edges) { path.moveTo(X(KEY[a]), Y(KEY[a])); path.lineTo(X(KEY[b]), Y(KEY[b])); }
+      const w = Math.max(1.5, Math.abs(Y(152) - Y(10)) / 110);
+      for (const i of KEY) { dots.moveTo(X(i) + w, Y(i)); dots.arc(X(i), Y(i), w, 0, 6.283); }
+      ctx.save(); ctx.globalAlpha = faceA;
+      neon(path, `hsl(${hue},100%,60%)`, w, 16);
+      ctx.fillStyle = `hsl(${hue},100%,85%)`; ctx.fill(dots);
+      ctx.restore();
+    }
+
+    // efek tangan di atas mesh wajah
+    if (haveHand && handA > .02) drawHand(now, ox, oy, dw, dh);
+    drawParts(dt);
+
+    frames++;
+    if (now - fpsT > 500) { $("fps").textContent = "FPS: " + (frames * 1000 / (now - fpsT)).toFixed(1) + " | hit: " + detHits + "/" + detCalls + " | undef: " + detUndef + " | vt: " + lastVT.toFixed(2); frames = 0; fpsT = now; }
+  }
+  requestAnimationFrame(loop);
+}
+
+addEventListener("keydown", e => {
+  if (e.code === "Space") { e.preventDefault(); scatterUntil = performance.now() + 1600; }
+  if (e.key === "f") document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  if (e.key === "h") document.body.classList.toggle("hide");
+});
+
+init().then(start).catch(e => showErr("Gagal: " + (e.message || e)));
+</script>
+</body>
+</html>
+
+
+
